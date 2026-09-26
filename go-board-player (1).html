@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trump Apples</title>
+<style>
+  :root{
+    --fg: #39ff6a;
+    --fg-dim: #1f7a3a;
+    --border: #1f4a2c;
+    --panel: rgba(10,13,10,0.85);
+  }
+  *{ box-sizing:border-box; }
+  html,body{
+    margin:0; padding:0; width:100%; height:100%; background:#000; overflow:hidden;
+    font-family: ui-monospace, "SF Mono", Consolas, monospace;
+  }
+  #stage{
+    width:100vw; height:100vh; display:flex; align-items:center; justify-content:center;
+  }
+  #boardCanvas{ display:block; }
+
+  #overlay{
+    position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+    background:#000; color:var(--fg); z-index:10; text-align:center; cursor:pointer;
+  }
+  #overlay.hidden{ display:none; }
+  #overlay h1{ font-size:16px; letter-spacing:0.06em; margin:0 0 8px; font-weight:600; }
+  #overlay p{ font-size:12px; color:var(--fg-dim); margin:0; }
+  #overlay.error{ cursor:default; }
+  #overlay.error h1{ color:#ff5c5c; }
+
+  #bar{
+    position:fixed; left:50%; bottom:16px; transform:translateX(-50%);
+    display:flex; align-items:center; gap:10px; padding:8px 14px;
+    background:var(--panel); border:1px solid var(--border); border-radius:3px;
+    color:var(--fg); font-size:12px; z-index:5; opacity:0.55; transition:opacity 0.15s;
+  }
+  #bar.hidden{ display:none; }
+  #bar:hover{ opacity:1; }
+  #bar button{
+    background:transparent; border:1px solid var(--fg-dim); color:var(--fg);
+    padding:5px 12px; font-family:inherit; font-size:12px; cursor:pointer; border-radius:2px;
+  }
+  #bar button:hover{ border-color:var(--fg); }
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <canvas id="boardCanvas"></canvas>
+</div>
+
+<div id="overlay">
+  <div>
+    <h1 id="overlayTitle">Trump Apples</h1>
+    <p id="overlayText">loading…</p>
+  </div>
+</div>
+
+<div id="bar" class="hidden">
+  <button id="pauseBtn">pause</button>
+  <button id="restartBtn">restart</button>
+  <span id="recIndicator" style="display:none;color:#ff5c5c;">● rec</span>
+</div>
+
+<audio id="audio" src="audio.mp4" preload="auto"></audio>
+
+<script>
+(() => {
+  // Source frame grid (from frames.txt)
+  const SRC_COLS = 40, SRC_ROWS = 30;
+  // Go board size
+  const N = 19;
+  const FALLBACK_DURATION_SECONDS = 3 * 60 + 39; // used only if audio.duration is unavailable
+  const HOSHI = [3, 9, 15]; // 0-indexed star point coordinates on a 19x19 board
+
+  const canvas = document.getElementById('boardCanvas');
+  const ctx = canvas.getContext('2d');
+  const overlay = document.getElementById('overlay');
+  const overlayTitle = document.getElementById('overlayTitle');
+  const overlayText = document.getElementById('overlayText');
+  const bar = document.getElementById('bar');
+  const pauseBtn = document.getElementById('pauseBtn');
+  const restartBtn = document.getElementById('restartBtn');
+  const audio = document.getElementById('audio');
+  const recIndicator = document.getElementById('recIndicator');
+
+  let stoneFrames = [];   // string[], each N*N chars: 'b' | 'w' | '.' (no stone / interior territory)
+  let fps = 30;
+  let lastDrawnIndex = -1;
+  let boardSize = 0, margin = 0, cellSize = 0;
+  let mediaRecorder = null;
+  let recordedChunks = [];
+  let recordingStarted = false;
+
+  function showError(message) {
+    overlay.classList.remove('hidden');
+    overlay.classList.add('error');
+    overlayTitle.textContent = 'Trump Apples';
+    overlayText.textContent = message;
+    bar.classList.add('hidden');
+  }
+
+  function loadAudioMetadata() {
+    return new Promise((resolve, reject) => {
+      if (audio.readyState >= 1) return resolve();
+      audio.addEventListener('loadedmetadata', () => resolve(), { once: true });
+      audio.addEventListener('error', () => reject(new Error('could not load audio.mp4')), { once: true });
+    });
+  }
+
+  function parseFrames(text) {
+    return text.split('\n').map(l => l.replace(/\r$/, '')).filter(l => l.length > 0);
+  }
+
+  // Block boundaries mapping SRC_COLS/SRC_ROWS down to N, e.g. colBounds[i]..colBounds[i+1)
+  function blockBounds(total, n) {
+    const b = new Array(n + 1);
+    for (let i = 0; i <= n; i++) b[i] = Math.floor((i * total) / n);
+    return b;
+  }
+
+  // Downsample one raw 40x30 frame string to an N x N grid of 'b'/'w' via majority vote per block.
+  function downsample(frame, colBounds, rowBounds) {
+    const grid = new Array(N * N);
+    for (let gy = 0; gy < N; gy++) {
+      const y0 = rowBounds[gy], y1 = rowBounds[gy + 1];
+      for (let gx = 0; gx < N; gx++) {
+        const x0 = colBounds[gx], x1 = colBounds[gx + 1];
+        let black = 0, total = 0;
+        for (let y = y0; y < y1; y++) {
+          const rowOff = y * SRC_COLS;
+          for (let x = x0; x < x1; x++) {
+            total++;
+            if (frame[rowOff + x] === '*') black++;
+          }
+        }
+        grid[gy * N + gx] = (black * 2 >= total) ? 'b' : 'w';
+      }
+    }
+    return grid;
+  }
+
+  // Keep a stone only where a cell's color differs from at least one orthogonal in-bounds
+  // neighbor (a territory border). Strictly interior cells are left empty.
+  function toBorderStones(grid) {
+    let out = '';
+    for (let gy = 0; gy < N; gy++) {
+      for (let gx = 0; gx < N; gx++) {
+        const here = grid[gy * N + gx];
+        let isBorder = false;
+        if (gx > 0 && grid[gy * N + (gx - 1)] !== here) isBorder = true;
+        if (!isBorder && gx < N - 1 && grid[gy * N + (gx + 1)] !== here) isBorder = true;
+        if (!isBorder && gy > 0 && grid[(gy - 1) * N + gx] !== here) isBorder = true;
+        if (!isBorder && gy < N - 1 && grid[(gy + 1) * N + gx] !== here) isBorder = true;
+        out += isBorder ? here : '.';
+      }
+    }
+    return out;
+  }
+
+  function resizeCanvas() {
+    boardSize = Math.floor(Math.min(window.innerWidth, window.innerHeight) * 0.94);
+    canvas.width = boardSize;
+    canvas.height = boardSize;
+    margin = boardSize * 0.055;
+    cellSize = (boardSize - margin * 2) / (N - 1);
+    lastDrawnIndex = -1;
+  }
+
+  function px(i) { return margin + i * cellSize; }
+
+  function drawBoardBase() {
+    // wood background
+    const g = ctx.createLinearGradient(0, 0, boardSize, boardSize);
+    g.addColorStop(0, '#e7c17c');
+    g.addColorStop(1, '#c99a5c');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, boardSize, boardSize);
+    ctx.strokeStyle = '#5c3a1e';
+    ctx.lineWidth = Math.max(2, boardSize * 0.006);
+    ctx.strokeRect(ctx.lineWidth / 2, ctx.lineWidth / 2, boardSize - ctx.lineWidth, boardSize - ctx.lineWidth);
+
+    // grid lines
+    ctx.strokeStyle = '#3b2412';
+    ctx.lineWidth = Math.max(1, boardSize * 0.0018);
+    ctx.beginPath();
+    for (let i = 0; i < N; i++) {
+      const p = px(i);
+      ctx.moveTo(p, px(0)); ctx.lineTo(p, px(N - 1));
+      ctx.moveTo(px(0), p); ctx.lineTo(px(N - 1), p);
+    }
+    ctx.stroke();
+
+    // star points
+    ctx.fillStyle = '#3b2412';
+    for (const gy of HOSHI) {
+      for (const gx of HOSHI) {
+        ctx.beginPath();
+        ctx.arc(px(gx), px(gy), Math.max(2, cellSize * 0.09), 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+  }
+
+  function drawStone(gx, gy, color) {
+    const cx = px(gx), cy = px(gy);
+    const r = cellSize * 0.47;
+
+    // soft shadow
+    ctx.beginPath();
+    ctx.ellipse(cx + r * 0.12, cy + r * 0.18, r * 0.95, r * 0.95, 0, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(0,0,0,0.28)';
+    ctx.fill();
+
+    const grad = ctx.createRadialGradient(
+      cx - r * 0.35, cy - r * 0.4, r * 0.08,
+      cx, cy, r
+    );
+    if (color === 'b') {
+      grad.addColorStop(0, '#6a6a6a');
+      grad.addColorStop(0.35, '#2c2c2c');
+      grad.addColorStop(1, '#050505');
+    } else {
+      grad.addColorStop(0, '#ffffff');
+      grad.addColorStop(0.55, '#eeeae0');
+      grad.addColorStop(1, '#c9c2ae');
+    }
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.fillStyle = grad;
+    ctx.fill();
+    if (color === 'w') {
+      ctx.lineWidth = Math.max(0.5, r * 0.04);
+      ctx.strokeStyle = 'rgba(0,0,0,0.25)';
+      ctx.stroke();
+    }
+  }
+
+  function drawFrame(i) {
+    if (i === lastDrawnIndex) return;
+    const stones = stoneFrames[i];
+    if (!stones) return;
+    drawBoardBase();
+    for (let gy = 0; gy < N; gy++) {
+      for (let gx = 0; gx < N; gx++) {
+        const ch = stones[gy * N + gx];
+        if (ch === 'b' || ch === 'w') drawStone(gx, gy, ch);
+      }
+    }
+    lastDrawnIndex = i;
+  }
+
+  function renderLoop() {
+    const t = Math.min(audio.currentTime, (stoneFrames.length - 1) / fps);
+    const idx = Math.max(0, Math.min(stoneFrames.length - 1, Math.floor(t * fps)));
+    drawFrame(idx);
+    requestAnimationFrame(renderLoop);
+  }
+
+  function pickMimeType() {
+    const candidates = [
+      'video/mp4;codecs=h264,aac',
+      'video/webm;codecs=vp9,opus',
+      'video/webm;codecs=vp8,opus',
+      'video/webm'
+    ];
+    for (const t of candidates) {
+      if (window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t)) return t;
+    }
+    return '';
+  }
+
+  // Records the canvas + the audio element's own track from the moment playback truly
+  // starts, and auto-downloads the result once the audio ends. Runs once per page load.
+  function startRecording() {
+    if (recordingStarted) return;
+    if (!canvas.captureStream || !window.MediaRecorder) return; // unsupported browser, skip quietly
+    recordingStarted = true;
+    try {
+      const vStream = canvas.captureStream(Math.max(1, Math.round(fps)));
+      let aTracks = [];
+      const captureAudio = audio.captureStream || audio.mozCaptureStream;
+      if (captureAudio) {
+        aTracks = captureAudio.call(audio).getAudioTracks();
+      }
+      const combined = new MediaStream([...vStream.getVideoTracks(), ...aTracks]);
+      const mimeType = pickMimeType();
+      mediaRecorder = mimeType ? new MediaRecorder(combined, { mimeType }) : new MediaRecorder(combined);
+      recordedChunks = [];
+      mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) recordedChunks.push(e.data); };
+      mediaRecorder.onstop = saveRecording;
+      mediaRecorder.start();
+      if (recIndicator) recIndicator.style.display = 'inline';
+    } catch (e) {
+      recordingStarted = false;
+      console.warn('recording unavailable:', e);
+    }
+  }
+
+  function stopRecording() {
+    if (mediaRecorder && mediaRecorder.state === 'recording') mediaRecorder.stop();
+  }
+
+  function saveRecording() {
+    if (recIndicator) recIndicator.style.display = 'none';
+    if (!recordedChunks.length) return;
+    const mimeType = mediaRecorder.mimeType || 'video/webm';
+    const ext = mimeType.includes('mp4') ? 'mp4' : 'webm';
+    const blob = new Blob(recordedChunks, { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'trump-apples.' + ext;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  }
+
+  audio.addEventListener('ended', stopRecording);
+
+  async function begin() {
+    try {
+      const [text] = await Promise.all([
+        fetch('frames.txt').then(r => { if (!r.ok) throw new Error('frames.txt ' + r.status); return r.text(); }),
+        loadAudioMetadata()
+      ]);
+      const rawFrames = parseFrames(text);
+      if (rawFrames.length === 0) throw new Error('frames.txt had no frames');
+
+      overlayText.textContent = 'decoding board…';
+
+      const colBounds = blockBounds(SRC_COLS, N);
+      const rowBounds = blockBounds(SRC_ROWS, N);
+      stoneFrames = rawFrames.map(f => toBorderStones(downsample(f, colBounds, rowBounds)));
+
+      const duration = (isFinite(audio.duration) && audio.duration > 0) ? audio.duration : FALLBACK_DURATION_SECONDS;
+      fps = stoneFrames.length / duration;
+
+      window.addEventListener('resize', resizeCanvas);
+      resizeCanvas();
+      drawFrame(0);
+      requestAnimationFrame(renderLoop);
+
+      bar.classList.remove('hidden');
+      tryAutoplay();
+    } catch (e) {
+      showError('something went wrong loading this — ' + e.message);
+    }
+  }
+
+  function tryAutoplay() {
+    const p = audio.play();
+    if (p && typeof p.catch === 'function') {
+      p.then(() => {
+        overlay.classList.add('hidden');
+        startRecording();
+      }).catch(() => {
+        overlay.classList.remove('hidden');
+        overlay.classList.remove('error');
+        overlayTitle.textContent = 'Trump Apples';
+        overlayText.textContent = 'click to start';
+        overlay.addEventListener('click', startFromGesture, { once: true });
+      });
+    } else {
+      overlay.classList.add('hidden');
+    }
+  }
+
+  function startFromGesture() {
+    audio.play();
+    overlay.classList.add('hidden');
+    startRecording();
+  }
+
+  pauseBtn.addEventListener('click', () => {
+    if (audio.paused) {
+      audio.play();
+      pauseBtn.textContent = 'pause';
+    } else {
+      audio.pause();
+      pauseBtn.textContent = 'play';
+    }
+  });
+
+  restartBtn.addEventListener('click', () => {
+    audio.currentTime = 0;
+    audio.play();
+    pauseBtn.textContent = 'pause';
+  });
+
+  window.addEventListener('keydown', (e) => {
+    if (e.code === 'Space' && !bar.classList.contains('hidden')) {
+      e.preventDefault();
+      pauseBtn.click();
+    }
+  });
+
+  begin();
+})();
+</script>
+</body>
+</html>
